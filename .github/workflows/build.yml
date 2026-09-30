@@ -29,7 +29,7 @@ env:
   DAED_SOURCE_TAG: "v2.2.0"
 
   # Release 中二进制的文件名
-  DAED_ASSET: "daed.linux-x86_64"
+  DAED_ASSET: "daed-linux-x86_64"
 
   # RPM Version
   DAED_VERSION: "2.2.0"
