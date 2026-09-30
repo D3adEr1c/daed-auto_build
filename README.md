@@ -1,6 +1,6 @@
 # Daed Auto Build
 
-This repo automatically generate a `.rpm` file for `Fedora 44` with latest [`geoip`](https://github.com/v2fly/geoip) and [geosite](https://github.com/v2fly/domain-list-community)
+This repo automatically generate a `.rpm` file for `Fedora 44` with latest [`geoip`](https://github.com/v2fly/geoip) and [`geosite`](https://github.com/v2fly/domain-list-community)
 
 # Usage
 ```bash
@@ -11,7 +11,7 @@ sudo curl -fL \
 
 [Src code repo](https://github.com/D3adEr1c/daed-fc44)
 
-This version of daed contains v2.1.1 frontend and v2.1.1 backend with some fixes.
+This version of daed contains `v2.1.1` frontend and `v2.1.1` backend with some fixes.
 
 # LICENSE
 MIT LICENSE
