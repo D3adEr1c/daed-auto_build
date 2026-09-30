@@ -1,33 +1,46 @@
-name: Update Geo databases
+name: Update Geo databases and RPM repository
 
 on:
   workflow_dispatch:
+    inputs:
+      force:
+        description: "Force rebuild and republish"
+        required: false
+        type: boolean
+        default: false
 
   schedule:
     - cron: "0 0 * * *"
 
 permissions:
   contents: write
+  pages: write
+  id-token: write
 
 env:
-  # ================================
-  # daed binary
-  # ================================
+  # ============================================================
+  # daed binary source
+  # ============================================================
 
+  # 你的源码仓库，二进制放在这个仓库的 GitHub Release 中
   DAED_SOURCE_REPO: "D3adEr1c/daed-fc44"
 
+  # 存放二进制的 Release tag
   DAED_SOURCE_TAG: "v2.2.0"
 
-  DAED_ASSET: "daed-linux-x86_64"
+  # Release 中二进制的文件名
+  DAED_ASSET: "daed.linux-x86_64"
 
+  # RPM Version
   DAED_VERSION: "2.2.0"
 
+  # RPM Release 的基础编号
   DAED_RELEASE_BASE: "10"
 
 
 jobs:
-  update:
-    name: Build updated RPM
+  build:
+    name: Build RPM
     runs-on: ubuntu-latest
 
     container:
@@ -36,8 +49,12 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
 
-    steps:
+    outputs:
+      build: ${{ steps.check.outputs.build }}
+      release_tag: ${{ steps.versions.outputs.release_tag }}
+      rpm_name: ${{ steps.rpm.outputs.rpm_name }}
 
+    steps:
       # ============================================================
       # Environment
       # ============================================================
@@ -51,20 +68,22 @@ jobs:
             curl \
             jq \
             gh \
+            file \
             rpm \
             rpm-build \
             rpmdevtools \
             redhat-rpm-config \
             systemd-rpm-macros \
+            createrepo_c \
             findutils \
             coreutils
 
       - name: Checkout packaging repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
 
       # ============================================================
-      # Detect newest GeoSite / GeoIP releases
+      # Get latest GeoSite / GeoIP versions
       # ============================================================
 
       - name: Get latest GeoSite and GeoIP versions
@@ -73,15 +92,11 @@ jobs:
         run: |
           set -euo pipefail
 
-          echo "Querying GeoSite latest release..."
-
           SITE_JSON="$(
             curl -fsSL \
               -H "Accept: application/vnd.github+json" \
               https://api.github.com/repos/v2fly/domain-list-community/releases/latest
           )"
-
-          echo "Querying GeoIP latest release..."
 
           IP_JSON="$(
             curl -fsSL \
@@ -102,69 +117,102 @@ jobs:
             exit 1
           fi
 
-          RPM_RELEASE="${DAED_RELEASE_BASE}.SITE-${SITE_TAG}.IP-${IP_TAG}"
+          RPM_RELEASE="${DAED_RELEASE_BASE}.${SITE_TAG}.${IP_TAG}"
+
+          # 按你的要求：
+          # GitHub release 按 site/ip 数据版本命名
           RELEASE_TAG="data-${SITE_TAG}-${IP_TAG}"
+
+          # RPM 的最终文件名可以提前确定
+          EXPECTED_RPM="daed-${DAED_VERSION}-${RPM_RELEASE}.fc44.x86_64.rpm"
 
           {
             echo "site_tag=$SITE_TAG"
             echo "ip_tag=$IP_TAG"
             echo "rpm_release=$RPM_RELEASE"
             echo "release_tag=$RELEASE_TAG"
+            echo "expected_rpm=$EXPECTED_RPM"
           } >> "$GITHUB_OUTPUT"
 
-          echo
           echo "GeoSite:     $SITE_TAG"
           echo "GeoIP:       $IP_TAG"
           echo "RPM release: $RPM_RELEASE"
           echo "Release tag: $RELEASE_TAG"
+          echo "RPM:         $EXPECTED_RPM"
 
 
       # ============================================================
-      # Do nothing if this combination already exists
+      # Check whether this exact RPM already exists
+      #
+      # 注意：
+      # 不只是检测 Release tag。
+      #
+      # 这样以后即使 Geo 数据没变化，
+      # 你把 DAED_VERSION 从 2.2.0 改成 2.2.1，
+      # Action 仍然会生成新的 RPM。
       # ============================================================
 
-      - name: Check whether release already exists
-        id: existing
+      - name: Check existing release
+        id: check
         shell: bash
         run: |
           set -euo pipefail
 
           TAG="${{ steps.versions.outputs.release_tag }}"
+          EXPECTED_RPM="${{ steps.versions.outputs.expected_rpm }}"
 
-          if gh release view "$TAG" \
+          FORCE="false"
+
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            FORCE="${{ inputs.force }}"
+          fi
+
+          if [[ "$FORCE" == "true" ]]; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            echo "Forced rebuild requested."
+            exit 0
+          fi
+
+          if ! gh release view "$TAG" \
               --repo "$GITHUB_REPOSITORY" \
               >/dev/null 2>&1; then
 
-            echo "build=false" >> "$GITHUB_OUTPUT"
-            echo
-            echo "Release already exists:"
-            echo "$TAG"
-            echo
-            echo "No database update detected."
-
-          else
-
             echo "build=true" >> "$GITHUB_OUTPUT"
-            echo
-            echo "New database combination detected:"
-            echo "$TAG"
+            echo "Release does not exist."
+            exit 0
+          fi
 
+          ASSETS="$(
+            gh release view "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --json assets \
+              --jq '.assets[].name'
+          )"
+
+          if grep -Fxq "$EXPECTED_RPM" <<<"$ASSETS"; then
+            echo "build=false" >> "$GITHUB_OUTPUT"
+
+            echo "Already published:"
+            echo "$EXPECTED_RPM"
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+
+            echo "Data release exists, but this RPM does not:"
+            echo "$EXPECTED_RPM"
           fi
 
 
       # ============================================================
-      # RPM build tree
+      # RPM tree
       # ============================================================
 
       - name: Prepare RPM build tree
-        if: steps.existing.outputs.build == 'true'
+        if: steps.check.outputs.build == 'true'
         shell: bash
         run: |
           set -euo pipefail
 
           rpmdev-setuptree
-
-          mkdir -p "$HOME/rpmbuild/SOURCES"
 
           cp packaging/daed.service \
             "$HOME/rpmbuild/SOURCES/daed.service"
@@ -174,11 +222,11 @@ jobs:
 
 
       # ============================================================
-      # Download pre-built daed from your source repository
+      # daed binary
       # ============================================================
 
       - name: Download daed binary
-        if: steps.existing.outputs.build == 'true'
+        if: steps.check.outputs.build == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -186,10 +234,9 @@ jobs:
           mkdir -p /tmp/daed-release
           cd /tmp/daed-release
 
-          echo "Downloading:"
-          echo "  repository: $DAED_SOURCE_REPO"
-          echo "  release:    $DAED_SOURCE_TAG"
-          echo "  asset:      $DAED_ASSET"
+          echo "Repository: $DAED_SOURCE_REPO"
+          echo "Release:    $DAED_SOURCE_TAG"
+          echo "Asset:      $DAED_ASSET"
 
           gh release download "$DAED_SOURCE_TAG" \
             --repo "$DAED_SOURCE_REPO" \
@@ -200,24 +247,20 @@ jobs:
           install -Dm755 "$DAED_ASSET" \
             "$HOME/rpmbuild/SOURCES/daed"
 
-          echo
-          echo "Binary:"
           file "$HOME/rpmbuild/SOURCES/daed"
 
 
       # ============================================================
-      # Download latest GeoSite
+      # GeoSite
       # ============================================================
 
       - name: Download GeoSite
-        if: steps.existing.outputs.build == 'true'
+        if: steps.check.outputs.build == 'true'
         shell: bash
         run: |
           set -euo pipefail
 
           SITE_TAG="${{ steps.versions.outputs.site_tag }}"
-
-          echo "Downloading GeoSite $SITE_TAG"
 
           curl -fL \
             "https://github.com/v2fly/domain-list-community/releases/download/${SITE_TAG}/dlc.dat" \
@@ -229,18 +272,16 @@ jobs:
 
 
       # ============================================================
-      # Download latest GeoIP
+      # GeoIP
       # ============================================================
 
       - name: Download GeoIP
-        if: steps.existing.outputs.build == 'true'
+        if: steps.check.outputs.build == 'true'
         shell: bash
         run: |
           set -euo pipefail
 
           IP_TAG="${{ steps.versions.outputs.ip_tag }}"
-
-          echo "Downloading GeoIP $IP_TAG"
 
           curl -fL \
             "https://github.com/v2fly/geoip/releases/download/${IP_TAG}/geoip.dat" \
@@ -256,18 +297,13 @@ jobs:
       # ============================================================
 
       - name: Build RPM
-        if: steps.existing.outputs.build == 'true'
+        if: steps.check.outputs.build == 'true'
         shell: bash
         run: |
           set -euo pipefail
 
           SITE_TAG="${{ steps.versions.outputs.site_tag }}"
           IP_TAG="${{ steps.versions.outputs.ip_tag }}"
-
-          echo "Building:"
-          echo "  daed:    $DAED_VERSION"
-          echo "  GeoSite: $SITE_TAG"
-          echo "  GeoIP:   $IP_TAG"
 
           rpmbuild -bb packaging/daed.spec \
             --define "_topdir $HOME/rpmbuild" \
@@ -278,11 +314,11 @@ jobs:
 
 
       # ============================================================
-      # Find and inspect resulting RPM
+      # Locate RPM
       # ============================================================
 
-      - name: Inspect RPM
-        if: steps.existing.outputs.build == 'true'
+      - name: Locate and inspect RPM
+        if: steps.check.outputs.build == 'true'
         id: rpm
         shell: bash
         run: |
@@ -301,27 +337,28 @@ jobs:
             exit 1
           fi
 
+          RPM_NAME="$(basename "$RPM")"
+
           echo "rpm=$RPM" >> "$GITHUB_OUTPUT"
-          echo "rpm_name=$(basename "$RPM")" >> "$GITHUB_OUTPUT"
+          echo "rpm_name=$RPM_NAME" >> "$GITHUB_OUTPUT"
 
           echo
-          echo "Built RPM:"
+          echo "RPM:"
           echo "$RPM"
           echo
 
           rpm -qip "$RPM"
 
           echo
-          echo "Files:"
           rpm -qlp "$RPM"
 
 
       # ============================================================
-      # Publish GitHub Release
+      # GitHub Release
       # ============================================================
 
-      - name: Create GitHub Release
-        if: steps.existing.outputs.build == 'true'
+      - name: Publish GitHub Release
+        if: steps.check.outputs.build == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -329,6 +366,7 @@ jobs:
           TAG="${{ steps.versions.outputs.release_tag }}"
           SITE_TAG="${{ steps.versions.outputs.site_tag }}"
           IP_TAG="${{ steps.versions.outputs.ip_tag }}"
+
           RPM="${{ steps.rpm.outputs.rpm }}"
           RPM_NAME="${{ steps.rpm.outputs.rpm_name }}"
 
@@ -343,26 +381,128 @@ jobs:
 
           **RPM:** \`${RPM_NAME}\`
 
-          This package contains the pre-built daed binary together with the latest V2Fly GeoSite and GeoIP databases available when this release was created.
+          This RPM contains the pre-built daed binary and the latest
+          V2Fly GeoSite / GeoIP databases available at build time.
           EOF
 
-          gh release create "$TAG" \
-            "$RPM" \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "Geo data ${SITE_TAG} / ${IP_TAG}" \
-            --notes-file /tmp/release-notes.md
+          if gh release view "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              >/dev/null 2>&1; then
+
+            echo "Release exists; uploading RPM..."
+
+            gh release upload "$TAG" \
+              "$RPM" \
+              --repo "$GITHUB_REPOSITORY" \
+              --clobber
+
+          else
+
+            echo "Creating release..."
+
+            gh release create "$TAG" \
+              "$RPM" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Geo data ${SITE_TAG} / ${IP_TAG}" \
+              --notes-file /tmp/release-notes.md
+          fi
 
 
       # ============================================================
-      # Summary
+      # Build RPM-MD repository for GitHub Pages
+      #
+      # Pages 中只保留当前最新版 RPM。
+      # rpm-ostree 不需要历史 RPM 才能升级。
+      # ============================================================
+
+      - name: Build RPM repository
+        if: steps.check.outputs.build == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RPM="${{ steps.rpm.outputs.rpm }}"
+
+          rm -rf public
+          mkdir -p public/repo
+
+          cp "$RPM" public/repo/
+
+          createrepo_c public/repo
+
+          REPO_NAME="${GITHUB_REPOSITORY#*/}"
+
+          OWNER="$(
+            printf '%s' "$GITHUB_REPOSITORY_OWNER" \
+              | tr '[:upper:]' '[:lower:]'
+          )"
+
+          BASEURL="https://${OWNER}.github.io/${REPO_NAME}/repo/"
+
+          cat > public/daed-fc44.repo <<EOF
+          [daed-fc44]
+          name=daed for Fedora 44
+          baseurl=${BASEURL}
+          enabled=1
+          gpgcheck=0
+          repo_gpgcheck=0
+          metadata_expire=1h
+          EOF
+
+          cat > public/index.html <<EOF
+          <!doctype html>
+          <html>
+          <head>
+            <meta charset="utf-8">
+            <title>daed Fedora 44 repository</title>
+          </head>
+          <body>
+            <h1>daed Fedora 44 repository</h1>
+
+            <p>
+              <a href="daed-fc44.repo">
+                Download repository configuration
+              </a>
+            </p>
+
+            <p>
+              RPM repository:
+              <a href="repo/">repo/</a>
+            </p>
+          </body>
+          </html>
+          EOF
+
+          echo
+          echo "Repository:"
+          find public -maxdepth 3 -type f -print
+
+
+      # ============================================================
+      # Upload Pages artifact
+      # ============================================================
+
+      - name: Configure GitHub Pages
+        if: steps.check.outputs.build == 'true'
+        uses: actions/configure-pages@v5
+
+      - name: Upload GitHub Pages artifact
+        if: steps.check.outputs.build == 'true'
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: public
+
+
+      # ============================================================
+      # Job summary
       # ============================================================
 
       - name: Job summary
-        if: steps.existing.outputs.build == 'true'
+        if: steps.check.outputs.build == 'true'
         shell: bash
         run: |
           {
-            echo "## RPM published"
+            echo "## RPM built"
             echo
             echo "| Component | Version |"
             echo "|---|---|"
@@ -370,9 +510,38 @@ jobs:
             echo "| GeoSite | \`${{ steps.versions.outputs.site_tag }}\` |"
             echo "| GeoIP | \`${{ steps.versions.outputs.ip_tag }}\` |"
             echo
-            echo "Release:"
+            echo "**Release:**"
             echo "\`${{ steps.versions.outputs.release_tag }}\`"
             echo
-            echo "RPM:"
+            echo "**RPM:**"
             echo "\`${{ steps.rpm.outputs.rpm_name }}\`"
           } >> "$GITHUB_STEP_SUMMARY"
+
+
+  # ==============================================================
+  # GitHub Pages deploy
+  # ==============================================================
+
+  deploy:
+    name: Deploy RPM repository
+
+    if: needs.build.outputs.build == 'true'
+
+    needs:
+      - build
+
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Deploy GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
